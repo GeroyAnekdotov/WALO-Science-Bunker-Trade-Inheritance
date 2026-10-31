@@ -1,0 +1,459 @@
+-- Warfare Science Bunker Trade Inheritance v1.4
+-- Target: WALO 1.6.10 + Anomaly/GAMMA
+--
+-- Purpose:
+--   Captured Ecologist bunkers keep their scientific market role even when
+--   their service NPCs belong to the conquering faction.
+--
+--   Yantar  (yan_smart_terrain_6_4) -> Sakharov trade profile
+--   Jupiter (jup_b41)               -> Hermann trade profile
+--
+-- v1.4 changes:
+--   * fixes the GAMMA/UI Rework trader-level label by patching
+--     ui_inventory.supply_level, which has its own independent tier calculator
+--   * hardens the existing-trader scan so it only calls alive() on stalkers
+--
+-- v1.3 changes:
+--   * fixes the displayed trader supply tier used by trader_autoinject/UI
+--   * trader_autoinject.supply_level now uses the same owner-faction-aware
+--     scientific progression as the real stock for captured science bunkers
+--
+-- v1.2 changes:
+--   * fixes already-existing traders, not only future trade_init calls
+--   * resolves the NPC smart through xr_gulag when db.storage.gulag_name is nil
+--   * verifies and repairs the live trade_manager cfg_ltx
+--   * patches trade_manager.update so WALO/GAMMA cannot silently restore the
+--     ordinary faction profile on a later logic/job reinitialisation
+--   * evaluates the SCIENTIFIC buy_supplies condlist using the CURRENT OWNER
+--     faction goodwill instead of Ecologist goodwill
+--   * uses plain printf diagnostics so the log proves exactly what happened
+--
+-- It does NOT change the NPC's faction/community. A captured bunker remains
+-- staffed by the conquering faction; only the economic specialization is inherited.
+
+local VERSION = "1.4"
+local CHECK_INTERVAL_MS = 3000
+
+local science_trade_by_smart = {
+    ["yan_smart_terrain_6_4"] = "items\\trade\\trade_ecolog_sakharov.ltx",
+    ["jup_b41"]               = "items\\trade\\trade_ecolog_hermann.ltx",
+}
+
+local installed = false
+local base_trade_init = nil
+local base_trade_update = nil
+local base_supply_level = nil
+local supply_level_hook_installed = false
+local base_ui_supply_level = nil
+local ui_supply_level_hook_installed = false
+local next_check = {}
+local update_guard = {}
+
+local function logf(fmt, ...)
+    if printf then
+        printf("[SCI-TRADE v%s] " .. fmt, VERSION, ...)
+    end
+end
+
+local function normalize_path(s)
+    if not s then return nil end
+    return string.lower(string.gsub(s, "/", "\\"))
+end
+
+local function is_warfare_mode()
+    if IsWarfare then
+        local ok, v = pcall(IsWarfare)
+        if ok then return v == true end
+    end
+    return _G.WARFARE == true
+end
+
+local function is_generated_warfare_trader(npc)
+    if not npc then return false end
+
+    local sec = nil
+    if npc.section then
+        local ok, v = pcall(function() return npc:section() end)
+        if ok then sec = v end
+    end
+
+    if sec and string.find(sec, "^sim_default_%a+_trader$") then
+        return true
+    end
+
+    local name = nil
+    if npc.name then
+        local ok, v = pcall(function() return npc:name() end)
+        if ok then name = v end
+    end
+
+    return name and string.find(name, "sim_default_%a+_trader") ~= nil or false
+end
+
+local function get_smart_name(npc)
+    if not npc then return nil end
+
+    local id = npc:id()
+    local st = db and db.storage and db.storage[id]
+    if st and st.gulag_name and st.gulag_name ~= "" then
+        return st.gulag_name
+    end
+
+    if xr_gulag and xr_gulag.get_npc_smart then
+        local ok, smart = pcall(xr_gulag.get_npc_smart, npc)
+        if ok and smart then
+            if smart.name then
+                local ok_name, name = pcall(function() return smart:name() end)
+                if ok_name and name and name ~= "" then
+                    return name
+                end
+            end
+            if smart.section_name then
+                local ok_name, name = pcall(function() return smart:section_name() end)
+                if ok_name and name and name ~= "" then
+                    return name
+                end
+            end
+        end
+    end
+
+    -- Last fallback: server object's assigned smart terrain id.
+    if alife_object then
+        local ok_se, se = pcall(alife_object, id)
+        if ok_se and se and se.m_smart_terrain_id and se.m_smart_terrain_id ~= 65535 then
+            local ok_smart, smart_se = pcall(alife_object, se.m_smart_terrain_id)
+            if ok_smart and smart_se then
+                if smart_se.name then
+                    local ok_name, name = pcall(function() return smart_se:name() end)
+                    if ok_name and name and name ~= "" then return name end
+                end
+                if smart_se.section_name then
+                    local ok_name, name = pcall(function() return smart_se:section_name() end)
+                    if ok_name and name and name ~= "" then return name end
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function get_faction(npc)
+    if character_community then
+        local ok, v = pcall(character_community, npc)
+        if ok and v and v ~= "" and v ~= "none" and v ~= "trader" then
+            return v
+        end
+    end
+
+    if npc and npc.character_community then
+        local ok, v = pcall(function() return npc:character_community() end)
+        if ok and v and v ~= "" and v ~= "none" and v ~= "trader" then
+            return v
+        end
+    end
+
+    return nil
+end
+
+local function get_context(npc)
+    if not is_warfare_mode() or not is_generated_warfare_trader(npc) then
+        return nil
+    end
+
+    local smart_name = get_smart_name(npc)
+    local trade_ini = smart_name and science_trade_by_smart[smart_name]
+    if not trade_ini then
+        return nil
+    end
+
+    local faction = get_faction(npc)
+    if not faction then
+        return nil
+    end
+
+    return {
+        id = npc:id(),
+        smart_name = smart_name,
+        trade_ini = trade_ini,
+        faction = faction,
+    }
+end
+
+local function rewrite_science_goodwill(raw, faction)
+    if not raw or not faction then return raw, 0 end
+
+    local patched = raw
+    local total = 0
+    local funcs = {
+        "actor_goodwill_ge",
+        "actor_goodwill_gt",
+        "actor_goodwill_le",
+        "actor_goodwill_lt",
+    }
+
+    for _, fn in ipairs(funcs) do
+        local pattern = fn .. "%(%s*ecolog%s*:"
+        local replacement = fn .. "(" .. faction .. ":"
+        local count = 0
+        patched, count = string.gsub(patched, pattern, replacement)
+        total = total + (count or 0)
+    end
+
+    return patched, total
+end
+
+local function ensure_science_profile(npc, ctx)
+    if not trade_manager or not trade_manager.get_trade_profile or not base_trade_init then
+        return false
+    end
+
+    local current = trade_manager.get_trade_profile(ctx.id, "cfg_ltx")
+    if normalize_path(current) == normalize_path(ctx.trade_ini) then
+        return false
+    end
+
+    base_trade_init(npc, ctx.trade_ini)
+
+    local now = trade_manager.get_trade_profile(ctx.id, "cfg_ltx")
+    logf(
+        "profile repair npc=%s id=%s smart=%s faction=%s old=%s new=%s",
+        tostring(npc:name()), tostring(ctx.id), tostring(ctx.smart_name), tostring(ctx.faction),
+        tostring(current), tostring(now)
+    )
+
+    return true
+end
+
+local function resolve_science_supply(npc, ctx)
+    if not trade_manager or not trade_manager.get_trade_cfg then
+        return nil, nil, 0, nil
+    end
+
+    local cfg_ltx = trade_manager.get_trade_profile(ctx.id, "cfg_ltx")
+    local config = cfg_ltx and trade_manager.get_trade_cfg(cfg_ltx)
+
+    if not config then
+        -- trade_init normally populates the cache, but be tolerant if another
+        -- monkeypatch delays it.
+        local ok, ini = pcall(ini_file, ctx.trade_ini)
+        if ok then config = ini end
+    end
+
+    if not config then
+        return nil, nil, 0, nil
+    end
+
+    local raw = config:r_string_ex("trader", "buy_supplies")
+    if not raw or raw == "" then
+        return nil, config, 0, raw
+    end
+
+    local patched, replacements = rewrite_science_goodwill(raw, ctx.faction)
+    local condlist = xr_logic.parse_condlist(npc, "trader", "buy_supplies", patched)
+    local desired = condlist and xr_logic.pick_section_from_condlist(db.actor, npc, condlist)
+
+    return desired, config, replacements, raw
+end
+
+local function science_supply_level(npc, as_number)
+    local ctx = get_context(npc)
+    if not ctx then return nil end
+
+    local desired = resolve_science_supply(npc, ctx)
+    if not desired or desired == "" then return nil end
+
+    if as_number then
+        local n = string.match(desired, "supplies_(%d+)")
+        return n and tonumber(n) or nil
+    end
+
+    return desired
+end
+
+local function install_supply_level_hook()
+    if supply_level_hook_installed then return end
+    if not trader_autoinject or not trader_autoinject.supply_level then
+        return
+    end
+
+    base_supply_level = trader_autoinject.supply_level
+    trader_autoinject.supply_level = function(npc, as_number)
+        local v = science_supply_level(npc, as_number)
+        if v ~= nil then
+            return v
+        end
+        return base_supply_level(npc, as_number)
+    end
+
+    supply_level_hook_installed = true
+    logf("trader_autoinject.supply_level hook installed")
+end
+
+local function install_ui_supply_level_hook()
+    if ui_supply_level_hook_installed then return end
+    if not ui_inventory or not ui_inventory.supply_level then
+        return
+    end
+
+    base_ui_supply_level = ui_inventory.supply_level
+    ui_inventory.supply_level = function(npc, as_number)
+        local v = science_supply_level(npc, as_number)
+        if v ~= nil then
+            return v
+        end
+        return base_ui_supply_level(npc, as_number)
+    end
+
+    ui_supply_level_hook_installed = true
+    logf("ui_inventory.supply_level hook installed")
+end
+
+local function apply_science_supply(npc, ctx, force, reason)
+    if not db or not db.actor then return false end
+
+    local tm = trade_manager and trade_manager.get_trade_profile and trade_manager.get_trade_profile(ctx.id)
+    if not tm then
+        logf("no trade profile npc=%s id=%s reason=%s", tostring(npc:name()), tostring(ctx.id), tostring(reason))
+        return false
+    end
+
+    local desired, config, replacements, raw = resolve_science_supply(npc, ctx)
+    if not desired or desired == "" or desired == "nil" then
+        logf(
+            "cannot resolve tier npc=%s id=%s smart=%s faction=%s cfg=%s raw=%s",
+            tostring(npc:name()), tostring(ctx.id), tostring(ctx.smart_name), tostring(ctx.faction),
+            tostring(tm.cfg_ltx), tostring(raw)
+        )
+        return false
+    end
+
+    local before = tm.current_buy_supplies
+    if force or before ~= desired then
+        npc:buy_supplies(config, desired)
+        tm.current_buy_supplies = desired
+
+        logf(
+            "stock repair npc=%s id=%s smart=%s faction=%s tier=%s -> %s cfg=%s replacements=%s reason=%s",
+            tostring(npc:name()), tostring(ctx.id), tostring(ctx.smart_name), tostring(ctx.faction),
+            tostring(before), tostring(desired), tostring(tm.cfg_ltx), tostring(replacements), tostring(reason)
+        )
+        return true
+    end
+
+    return false
+end
+
+local function repair_science_trader(npc, force, reason)
+    if not npc or not npc:alive() then return end
+
+    local ctx = get_context(npc)
+    if not ctx then return end
+
+    if update_guard[ctx.id] then return end
+    update_guard[ctx.id] = true
+
+    local profile_changed = ensure_science_profile(npc, ctx)
+
+    -- When switching from an ordinary faction profile to the scientific one,
+    -- run the normal GAMMA update once so buy/sell conditions and the profile
+    -- cache are initialized. Then overwrite only the buy_supplies choice with
+    -- the owner-faction-aware scientific tier.
+    if profile_changed and base_trade_update then
+        base_trade_update(npc, true)
+    end
+
+    apply_science_supply(npc, ctx, force or profile_changed, reason)
+
+    update_guard[ctx.id] = nil
+end
+
+local function install_hooks()
+    if installed then return end
+    if not trade_manager or not trade_manager.trade_init or not trade_manager.update then
+        logf("trade_manager API missing; installation deferred")
+        return
+    end
+
+    base_trade_init = trade_manager.trade_init
+    base_trade_update = trade_manager.update
+    install_supply_level_hook()
+    install_ui_supply_level_hook()
+
+    trade_manager.trade_init = function(npc, cfg)
+        local ctx = get_context(npc)
+        if ctx then
+            cfg = ctx.trade_ini
+        end
+        return base_trade_init(npc, cfg)
+    end
+
+    trade_manager.update = function(npc, force_refresh)
+        local ctx = get_context(npc)
+        if not ctx then
+            return base_trade_update(npc, force_refresh)
+        end
+
+        if update_guard[ctx.id] then
+            return base_trade_update(npc, force_refresh)
+        end
+
+        update_guard[ctx.id] = true
+
+        local profile_changed = ensure_science_profile(npc, ctx)
+        local result = base_trade_update(npc, force_refresh or profile_changed)
+        apply_science_supply(npc, ctx, force_refresh or profile_changed, "trade_manager.update")
+
+        update_guard[ctx.id] = nil
+        return result
+    end
+
+    installed = true
+    logf("installed")
+end
+
+local function scan_existing_traders(reason)
+    if not db or not db.storage then return end
+
+    for _, st in pairs(db.storage) do
+        local npc = st and st.object
+        if npc and IsStalker and IsStalker(npc) and npc:alive() and is_generated_warfare_trader(npc) then
+            repair_science_trader(npc, true, reason)
+        end
+    end
+end
+
+function actor_on_first_update()
+    if not installed then install_hooks() end
+    install_supply_level_hook()
+    install_ui_supply_level_hook()
+    scan_existing_traders("actor_on_first_update")
+end
+
+function npc_on_update(npc, flags)
+    if not installed then install_hooks() end
+    install_supply_level_hook()
+    install_ui_supply_level_hook()
+    if not npc or not is_generated_warfare_trader(npc) then return end
+
+    local id = npc:id()
+    local now = time_global()
+    if next_check[id] and now < next_check[id] then return end
+    next_check[id] = now + CHECK_INTERVAL_MS
+
+    repair_science_trader(npc, false, "npc_on_update")
+end
+
+function npc_on_death_callback(npc, who)
+    if not npc then return end
+    local id = npc:id()
+    next_check[id] = nil
+    update_guard[id] = nil
+end
+
+function on_game_start()
+    install_hooks()
+    RegisterScriptCallback("actor_on_first_update", actor_on_first_update)
+    RegisterScriptCallback("npc_on_update", npc_on_update)
+    RegisterScriptCallback("npc_on_death_callback", npc_on_death_callback)
+end

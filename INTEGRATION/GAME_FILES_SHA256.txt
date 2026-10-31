@@ -1,0 +1,1 @@
+79f7eea41653bd77b932e6ad3b45223692f66f578aa046228261f8ecff3018cd  gamedata/scripts/zzzzzz_warfare_science_bunker_trade_fix.script

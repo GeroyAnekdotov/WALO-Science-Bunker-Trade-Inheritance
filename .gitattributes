@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# Retain exact original v1.4 bytes, regardless of core.autocrlf.
+/gamedata/scripts/zzzzzz_warfare_science_bunker_trade_fix.script -text
+/README.txt -text

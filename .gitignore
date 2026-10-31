@@ -1,0 +1,26 @@
+# Local reference material and generated release artifacts
+/_reference/
+/_shared_reference/
+/dist/
+/.venv/
+__pycache__/
+*.py[cod]
+
+# MO2 metadata, saves, logs and crash files
+meta.ini
+*.sav
+*.scop
+*.scoc
+*.[lL][oO][gG]
+*.[lL][oO][gG].*
+*.[dD][mM][pP]
+*.[mM][dD][mM][pP]
+*.bak
+*.tmp
+
+# Archives are distributed as release assets
+*.zip
+*.7z
+*.rar
+Thumbs.db
+Desktop.ini
